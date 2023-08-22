@@ -1,6 +1,9 @@
-#![feature(llvm_asm)]
+//! https://cfsamson.gitbook.io/green-threads-explained-in-200-lines-of-rust
+#![no_std]
+#![no_main]
 #![feature(naked_functions)]
-use std::ptr;
+#![allow(warnings)]
+use core::{arch::asm, ptr};
 
 // In our simple example we set most constraints here.
 const DEFAULT_STACK_SIZE: usize = 1024 * 1024 * 2;
@@ -8,7 +11,7 @@ const MAX_TASKS: usize = 4;
 static mut RUNTIME: usize = 0;
 
 pub struct Runtime {
-    tasks: Vec<Task>,
+    tasks: [Task; MAX_TASKS],
     current: usize,
 }
 
@@ -21,7 +24,7 @@ enum State {
 
 struct Task {
     id: usize,
-    stack: Vec<u8>,
+    stack: [u8; DEFAULT_STACK_SIZE],
     ctx: TaskContext,
     state: State,
 }
@@ -30,7 +33,7 @@ struct Task {
 #[repr(C)] // not strictly needed but Rust ABI is not guaranteed to be stable
 struct TaskContext {
     // 15 u64
-    x1: u64,  //ra: return addres
+    x1: u64,  //ra: return addr
     x2: u64,  //sp
     x8: u64,  //s0,fp
     x9: u64,  //s1
@@ -44,7 +47,7 @@ struct TaskContext {
     x25: u64,
     x26: u64,
     x27: u64,
-    nx1: u64, //new return addres
+    nx1: u64, //new return address
 }
 
 impl Task {
@@ -54,7 +57,7 @@ impl Task {
         // to do it here. The important part is that once allocated it MUST NOT move in memory.
         Task {
             id,
-            stack: vec![0_u8; DEFAULT_STACK_SIZE],
+            stack: [0_u8; DEFAULT_STACK_SIZE],
             ctx: TaskContext::default(),
             state: State::Available,
         }
@@ -66,20 +69,15 @@ impl Runtime {
         // This will be our base task, which will be initialized in the `running` state
         let base_task = Task {
             id: 0,
-            stack: vec![0_u8; DEFAULT_STACK_SIZE],
+            stack: [0_u8; DEFAULT_STACK_SIZE],
             ctx: TaskContext::default(),
             state: State::Running,
         };
 
         // We initialize the rest of our tasks.
-        let mut tasks = vec![base_task];
-        let mut available_tasks: Vec<Task> = (1..MAX_TASKS).map(|i| Task::new(i)).collect();
-        tasks.append(&mut available_tasks);
+        let tasks = [base_task, Task::new(1), Task::new(2), Task::new(3)];
 
-        Runtime {
-            tasks,
-            current: 0,
-        }
+        Runtime { tasks, current: 0 }
     }
 
     /// This is cheating a bit, but we need a pointer to our Runtime stored so we can call yield on it even if
@@ -95,7 +93,7 @@ impl Runtime {
     /// it returns false (which means that there are no tasks scheduled) and we are done.
     pub fn run(&mut self) -> ! {
         while self.t_yield() {}
-        std::process::exit(0);
+        exit();
     }
 
     /// This is our return function. The only place we use this is in our `guard` function.
@@ -180,10 +178,9 @@ impl Runtime {
             // enough space to actually get an aligned pointer in the first place).
             let s_ptr = (s_ptr as usize & !7) as *mut u8;
 
-            available.ctx.x1 = guard as u64;  //ctx.x1  is old return address
-            available.ctx.nx1 = f as u64;     //ctx.nx2 is new return address
+            available.ctx.x1 = guard as u64; //ctx.x1  is old return address
+            available.ctx.nx1 = f as u64; //ctx.nx2 is new return address
             available.ctx.x2 = s_ptr.offset(-32) as u64; //cxt.x2 is sp
-
         }
         available.state = State::Ready;
     }
@@ -241,10 +238,10 @@ pub fn yield_task() {
 ///
 /// see: https://github.com/rust-lang/rfcs/blob/master/text/1201-naked-fns.md
 #[naked]
-#[inline(never)]
 unsafe fn switch(old: *mut TaskContext, new: *const TaskContext) {
     // a0: old, a1: new
-    llvm_asm!("
+    asm!(
+        "
         sd x1, 0x00(a0)
         sd x2, 0x08(a0)
         sd x8, 0x10(a0)
@@ -278,12 +275,14 @@ unsafe fn switch(old: *mut TaskContext, new: *const TaskContext) {
         ld t0, 0x70(a1)
 
         jr t0
-    "
-    :    :    :    : "volatile", "alignstack"
+    ",
+        options(noreturn)
     );
 }
 
-fn main() {
+// cargo b && qemu-riscv64 target/riscv64gc-unknown-none-elf/debug/green_threads
+#[no_mangle]
+fn _start() -> ! {
     let mut runtime = Runtime::new();
     runtime.init();
     runtime.spawn(|| {
@@ -305,4 +304,65 @@ fn main() {
         println!("TASK 2 FINISHED");
     });
     runtime.run();
+    println!("end");
+    exit();
+    unreachable!()
+}
+
+struct Stdout;
+
+impl core::fmt::Write for Stdout {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let stdout_fd = 1;
+        let ret = syscall(SYSCALL_WRITE, stdout_fd, s.as_ptr() as usize, s.len());
+        assert!(ret != -1);
+        Ok(())
+    }
+}
+
+#[cfg(not)]
+fn putchar(c: u8) {
+    #[allow(deprecated)]
+    sbi_rt::legacy::console_putchar(c as usize);
+}
+
+#[panic_handler]
+fn panic_handler(info: &core::panic::PanicInfo) -> ! {
+    println!("panic_handler");
+    exit();
+    loop {}
+}
+
+fn syscall(a7_syscall_id: usize, a0: usize, a1: usize, a2: usize) -> isize {
+    let mut ret: isize;
+    unsafe {
+        asm!(
+            "ecall",
+            inlateout("x10") a0 => ret,
+            in("x11") a1,
+            in("x12") a2,
+            in("x17" ) a7_syscall_id
+        );
+    }
+    ret
+}
+
+const SYSCALL_WRITE: usize = 64;
+const SYSCALL_EXIT: usize = 93;
+
+fn print(args: core::fmt::Arguments) {
+    core::fmt::Write::write_fmt(&mut Stdout, args).unwrap();
+}
+
+#[macro_export]
+/// println string macro
+macro_rules! println {
+    ($fmt: literal $(, $($arg: tt)+)?) => {
+        print(format_args!(concat!($fmt, "\n") $(, $($arg)+)?));
+    }
+}
+
+fn exit() -> ! {
+    syscall(SYSCALL_EXIT, 0, 0, 0);
+    unreachable!();
 }
